@@ -1,0 +1,126 @@
+diff --git a/src/controllers/investorReportShareController.ts b/src/controllers/investorReportShareController.ts
+index c568c77..e8b4bd6 100644
+--- a/src/controllers/investorReportShareController.ts
++++ b/src/controllers/investorReportShareController.ts
+@@ -13,7 +13,7 @@ class InvestorReportShareController {
+    * POST /api/v1/reports/share
+    * Business owner generates a read-only, expiring link to their current
+    * report (e.g. to send to a prospective investor).
+-   * Body: { range, startDate?, endDate?, recipientName?, recipientEmail? }
++   * Body: { range, startDate?, endDate?, recipientName?, recipientEmail?, maxViews? }
+    */
+   async create(req: Request, res: Response, next: NextFunction) {
+     try {
+@@ -24,6 +24,7 @@ class InvestorReportShareController {
+         endDate,
+         recipientName,
+         recipientEmail,
++        maxViews,
+       } = req.body ?? {};
+ 
+       if (!VALID_RANGE_KEYS.includes(range)) {
+@@ -42,12 +43,21 @@ class InvestorReportShareController {
+         return;
+       }
+ 
++      if (maxViews !== undefined && !(Number.isInteger(maxViews) && maxViews >= 1)) {
++        res.status(400).json({
++          success: false,
++          message: 'maxViews must be a positive whole number.',
++        });
++        return;
++      }
++
+       const { shareUrl, expiresAt } = await InvestorReportShareService.createShare(ownerId, {
+         rangeKey: range,
+         startDate,
+         endDate,
+         recipientName,
+         recipientEmail,
++        maxViews,
+       });
+ 
+       const owner = await User.findById(ownerId).lean();
+diff --git a/src/models/investorReportShare.model.ts b/src/models/investorReportShare.model.ts
+index 8a76415..f3c7376 100644
+--- a/src/models/investorReportShare.model.ts
++++ b/src/models/investorReportShare.model.ts
+@@ -28,6 +28,8 @@ export interface IInvestorReportShare extends Document {
+   };
+   status: InvestorReportShareStatus;
+   expiresAt: Date;
++  // Optional cap on successful views; unset means unlimited.
++  maxViews?: number;
+   viewCount: number;
+   lastViewedAt?: Date;
+   createdBy: string;
+@@ -56,6 +58,7 @@ const InvestorReportShareSchema = new Schema<IInvestorReportShare>(
+     status:    { type: String, enum: ['active', 'revoked'], default: 'active' },
+     expiresAt: { type: Date, required: true },
+ 
++    maxViews:     { type: Number, min: 1 },
+     viewCount:    { type: Number, default: 0 },
+     lastViewedAt: { type: Date },
+ 
+diff --git a/src/routes/report.route.ts b/src/routes/report.route.ts
+index f1997e0..d1890b4 100644
+--- a/src/routes/report.route.ts
++++ b/src/routes/report.route.ts
+@@ -19,7 +19,7 @@ router.get('/products/:productId', authenticateToken, resolveBusinessOwner, chec
+ 
+ // Investor report sharing — owner-only. Generates a read-only link (expires in 2 days)
+ // to the current report snapshot, e.g. to send to a prospective investor.
+-// POST /api/reports/share  { range, startDate?, endDate?, recipientName?, recipientEmail? }
++// POST /api/reports/share  { range, startDate?, endDate?, recipientName?, recipientEmail?, maxViews? }
+ router.post('/share', authenticateToken, resolveBusinessOwner, requireOwner, checkSubscription('full_reports'), InvestorReportShareController.create);
+ 
+ // GET /api/reports/share — list links this owner has generated
+diff --git a/src/services/investorReportShareService.ts b/src/services/investorReportShareService.ts
+index 9da7026..39b33dc 100644
+--- a/src/services/investorReportShareService.ts
++++ b/src/services/investorReportShareService.ts
+@@ -22,6 +22,7 @@ export interface CreateShareOptions {
+   endDate?: string;
+   recipientName?: string;
+   recipientEmail?: string;
++  maxViews?: number;
+ }
+ 
+ export interface ShareView {
+@@ -77,6 +78,7 @@ class InvestorReportShareService {
+       businessSnapshot,
+       status:    'active',
+       expiresAt,
++      maxViews:  opts.maxViews,
+       createdBy: ownerId,
+     });
+ 
+@@ -84,7 +86,7 @@ class InvestorReportShareService {
+     return { token, shareUrl, expiresAt, share };
+   }
+ 
+-  /** Resolve a public token into the frozen snapshot, or throw if dead/revoked/expired. */
++  /** Resolve a public token into the frozen snapshot, or throw if dead/revoked/expired/used up. */
+   async getByToken(token: string): Promise<ShareView> {
+     const tokenHash = hashToken(token);
+     const share = await InvestorReportShare.findOne({ tokenHash });
+@@ -92,10 +94,15 @@ class InvestorReportShareService {
+     if (!share) throw new ApiError(404, 'This report link is invalid or no longer exists.');
+     if (share.status === 'revoked') throw new ApiError(410, 'This report link has been revoked by the business owner.');
+     if (share.expiresAt.getTime() < Date.now()) throw new ApiError(410, 'This report link has expired.');
+-
+-    share.viewCount    += 1;
+-    share.lastViewedAt = new Date();
+-    await share.save();
++    if (share.maxViews != null && share.viewCount >= share.maxViews) {
++      throw new ApiError(410, 'This report link has reached its view limit.');
++    }
++
++    // Atomic increment so concurrent views are not lost.
++    await InvestorReportShare.updateOne(
++      { _id: share._id },
++      { $inc: { viewCount: 1 }, $set: { lastViewedAt: new Date() } }
++    );
+ 
+     return {
+       business:   share.businessSnapshot,

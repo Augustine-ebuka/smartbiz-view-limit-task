@@ -1,0 +1,13 @@
+{
+  "name": "smartbiz-task-blockers",
+  "private": true,
+  "description": "Dependencies for the blocker tests of the investor report view-limit task. Run the blockers with: bash task/run_blockers.sh",
+  "config": {
+    "mongodbMemoryServer": {
+      "version": "7.0.14"
+    }
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "10.1.4"
+  }
+}
